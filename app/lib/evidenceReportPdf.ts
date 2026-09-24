@@ -1,5 +1,5 @@
 import PDFDocument from "pdfkit";
-import { parseDataUrl } from "@/app/lib/gemini";
+import { parseDataUrl } from "@/app/lib/groq";
 import {
   badgeHeight,
   badgeWidth,

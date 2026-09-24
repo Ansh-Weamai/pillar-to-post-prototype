@@ -1,8 +1,20 @@
 import { NextResponse } from "next/server";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getClient, MODEL, VisionResponseSchema, buildPhotoCheckPrompt } from "@/app/lib/gemini";
+import { callGroqJson, getClient, VisionResponseSchema, buildPhotoCheckPrompt } from "@/app/lib/groq";
+import { mapWithConcurrency } from "@/app/lib/concurrency";
 import type { ChecklistEntry, ItemUpdate } from "@/app/lib/types";
+
+// Kept low: Groq's free tier enforces a per-minute *output tokens* budget
+// (not just a request count), which firing every tagged location's photos
+// at once could exceed on its own — see callGroqJson's retry-after
+// handling for what happens when it does.
+const CONCURRENCY = 2;
+
+// Groq's free-tier per-minute output-token budget can force a real ~45s
+// retry wait per photo (see callGroqJson) — give a full demo tour room to
+// run instead of hitting Vercel's default function timeout.
+export const maxDuration = 120;
 
 type TourEntry = { location: string; photos: string[] };
 type ItemVerdict = { visible: boolean; confidence: number; reasoning: string };
@@ -24,30 +36,22 @@ async function checkPhoto(
   requiredItems: string[],
   photoPath: string
 ): Promise<Map<string, ItemVerdict>> {
-  let base64: string;
+  let dataUrl: string;
   try {
     const absPath = path.join(process.cwd(), "public", photoPath);
-    base64 = (await fs.readFile(absPath)).toString("base64");
+    const base64 = (await fs.readFile(absPath)).toString("base64");
+    dataUrl = `data:${mimeTypeForPath(photoPath)};base64,${base64}`;
   } catch {
     return unparseableMap(requiredItems, "photo file missing");
   }
 
   try {
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: buildPhotoCheckPrompt(location, requiredItems, false) },
-            { inlineData: { mimeType: mimeTypeForPath(photoPath), data: base64 } },
-          ],
-        },
-      ],
-      config: { responseMimeType: "application/json" },
-    });
-
-    const parsed = VisionResponseSchema.safeParse(JSON.parse(response.text ?? ""));
+    const parsed = await callGroqJson(
+      ai,
+      VisionResponseSchema,
+      buildPhotoCheckPrompt(location, requiredItems, false),
+      [dataUrl]
+    );
     if (!parsed.success) return unparseableMap(requiredItems, "model response unparseable");
 
     const map = unparseableMap(requiredItems, "item not returned by model");
@@ -77,38 +81,55 @@ export async function POST() {
 
     const ai = getClient(1);
 
-    // Pass A: only locations present in the tour proceed to Pass B (one Gemini call per photo, run in parallel).
+    // Pass A: only locations present in the tour proceed to Pass B — one
+    // model call per photo, across ALL tagged locations combined, run at a
+    // shared concurrency cap (not per-location) so a tour with several
+    // tagged rooms can't burst past the free-tier rate limit on its own.
     const taggedEntries = checklist.filter((entry) => tourByLocation.has(entry.location));
 
-    const taggedResults = await Promise.all(
-      taggedEntries.map(async (entry) => {
-        const tourEntry = tourByLocation.get(entry.location)!;
-        const thumbnail = tourEntry.photos[0];
+    const photoJobs = taggedEntries.flatMap((entry) => {
+      const tourEntry = tourByLocation.get(entry.location)!;
+      return tourEntry.photos.map((photo) => ({ entry, photo }));
+    });
 
-        const itemResults = new Map<string, ItemVerdict>();
-        if (!ai) {
-          for (const item of entry.required_items) {
-            itemResults.set(item, { visible: false, confidence: 0, reasoning: "GEMINI_API_KEY_1 not configured" });
-          }
-        } else {
-          const perPhotoMaps = await Promise.all(
-            tourEntry.photos.map((photo) => checkPhoto(ai, entry.location, entry.required_items, photo))
-          );
-          for (const item of entry.required_items) {
-            let best: ItemVerdict = { visible: false, confidence: 0, reasoning: "not checked" };
-            for (const map of perPhotoMaps) {
-              const r = map.get(item);
-              if (!r) continue;
-              if (r.visible && !best.visible) best = r;
-              else if (r.visible === best.visible && r.confidence > best.confidence) best = r;
-            }
-            itemResults.set(item, best);
-          }
+    const photoResults = ai
+      ? await mapWithConcurrency(photoJobs, CONCURRENCY, ({ entry, photo }) =>
+          checkPhoto(ai, entry.location, entry.required_items, photo)
+        )
+      : [];
+
+    const perPhotoMapsByLocation = new Map<string, Map<string, ItemVerdict>[]>();
+    photoJobs.forEach(({ entry }, i) => {
+      const list = perPhotoMapsByLocation.get(entry.location) ?? [];
+      list.push(photoResults[i]);
+      perPhotoMapsByLocation.set(entry.location, list);
+    });
+
+    const taggedResults = taggedEntries.map((entry) => {
+      const tourEntry = tourByLocation.get(entry.location)!;
+      const thumbnail = tourEntry.photos[0];
+
+      const itemResults = new Map<string, ItemVerdict>();
+      if (!ai) {
+        for (const item of entry.required_items) {
+          itemResults.set(item, { visible: false, confidence: 0, reasoning: "GROQ_API_KEY_1 not configured" });
         }
+      } else {
+        const perPhotoMaps = perPhotoMapsByLocation.get(entry.location) ?? [];
+        for (const item of entry.required_items) {
+          let best: ItemVerdict = { visible: false, confidence: 0, reasoning: "not checked" };
+          for (const map of perPhotoMaps) {
+            const r = map.get(item);
+            if (!r) continue;
+            if (r.visible && !best.visible) best = r;
+            else if (r.visible === best.visible && r.confidence > best.confidence) best = r;
+          }
+          itemResults.set(item, best);
+        }
+      }
 
-        return { location: entry.location, thumbnail, itemResults };
-      })
-    );
+      return { location: entry.location, thumbnail, itemResults };
+    });
 
     const resultsByLocation = new Map(taggedResults.map((r) => [r.location, r]));
 

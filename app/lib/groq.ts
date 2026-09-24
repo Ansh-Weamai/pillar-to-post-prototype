@@ -1,15 +1,15 @@
-import { GoogleGenAI } from "@google/genai";
+import Groq from "groq-sdk";
 import { z } from "zod";
 import type { ChecklistEntry } from "@/app/lib/types";
 
-export const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+export const MODEL = process.env.GROQ_MODEL || "qwen/qwen3.8-27b";
 
-// Each feature calls out with its own key (GEMINI_API_KEY_1/2/3) so usage/
-// quota/billing can be tracked and capped per feature independently, even
-// though all three hit the same model.
-export function getClient(feature: 1 | 2 | 3): GoogleGenAI | null {
-  const apiKey = process.env[`GEMINI_API_KEY_${feature}`];
-  return apiKey ? new GoogleGenAI({ apiKey }) : null;
+// Each feature calls out with its own key (GROQ_API_KEY_1/2/3) so usage/
+// quota/rate limits can be tracked and capped per feature independently,
+// even though all three hit the same model.
+export function getClient(feature: 1 | 2 | 3): Groq | null {
+  const apiKey = process.env[`GROQ_API_KEY_${feature}`];
+  return apiKey ? new Groq({ apiKey }) : null;
 }
 
 export const ItemResultSchema = z.object({
@@ -62,19 +62,19 @@ comments panel) around the actual room content, ignore the chrome and judge
 only the photographed scene itself.`;
 }
 
-export function buildReportCheckPrompt(checklist: ChecklistEntry[]) {
+export function buildReportCheckPrompt(checklist: ChecklistEntry[], source: "image" | "text" = "image") {
   const checklistText = checklist
     .map((entry) => `- ${entry.location}: ${entry.required_items.join(", ")}`)
     .join("\n");
 
-  return `You are looking at a home inspection report. Here is the full checklist of
+  return `You are looking at ${source === "text" ? "the text extracted from" : ""} a home inspection report. Here is the full checklist of
 locations and required items we expect to see documented:
 
 ${checklistText}
 
 Go through the document and determine, for EACH location above:
-1. Is this location discussed or photographed anywhere in the document?
-2. For each required item under that location, is it visibly documented?
+1. Is this location discussed${source === "image" ? " or photographed" : ""} anywhere in the document?
+2. For each required item under that location, is it ${source === "image" ? "visibly" : "clearly"} documented?
 3. If documented, what condition does the report state or imply for it —
    "Satisfactory" (no issue reported), "Needs Repair" (a defect, damage, or
    repair recommendation is stated), or "Limitation" (the report explicitly
@@ -125,8 +125,8 @@ export const EvidenceCheckModelResponseSchema = z.object({
 
 export type EvidenceCheckModelResponse = z.infer<typeof EvidenceCheckModelResponseSchema>;
 
-// Shared across Feature 2 and Feature 3 — appended to the same prompt and
-// resent once if the first response fails schema validation.
+// Shared across features — appended to the prompt and resent once if the
+// first response fails schema validation.
 export const RETRY_JSON_ONLY_SUFFIX =
   "Your previous response could not be parsed as valid JSON. Return ONLY the JSON object, nothing else — no explanation, no markdown code fences.";
 
@@ -309,4 +309,100 @@ export function parseDataUrl(dataUrl: string): { mimeType: string; data: string 
   const match = /^data:([^;]+);base64,([\s\S]+)$/.exec(dataUrl);
   if (!match) throw new Error("invalid data URL");
   return { mimeType: match[1], data: match[2] };
+}
+
+// A handful of transient failure modes worth one backoff-retry round on:
+// rate limiting and server-side/transient errors. Anything else (bad
+// request, auth, not found) fails fast instead of stalling the request.
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const DEFAULT_RETRY_DELAY_MS = 1500;
+// Groq's free tier enforces a per-minute *output tokens* budget (not just
+// request count) that's easy to exceed with one non-trivial JSON response —
+// a 429 here comes back with a `retry-after` header naming the actual wait
+// (seen up to ~45s in testing). Respect it (capped, so one retry can't run
+// past a route's maxDuration) rather than a fixed short backoff that has no
+// chance of clearing a per-minute quota.
+const MAX_RETRY_DELAY_MS = 50_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorStatus(e: unknown): number | undefined {
+  return e && typeof e === "object" && "status" in e && typeof (e as { status: unknown }).status === "number"
+    ? (e as { status: number }).status
+    : undefined;
+}
+
+function isRetryableError(e: unknown): boolean {
+  const status = errorStatus(e);
+  return status === undefined || RETRYABLE_STATUS_CODES.has(status);
+}
+
+function retryDelayMs(e: unknown): number {
+  const headers = e && typeof e === "object" && "headers" in e ? (e as { headers: unknown }).headers : undefined;
+  const retryAfter = headers instanceof Headers ? headers.get("retry-after") : null;
+  const seconds = retryAfter ? Number(retryAfter) : NaN;
+  return Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, MAX_RETRY_DELAY_MS) : DEFAULT_RETRY_DELAY_MS;
+}
+
+// Runs a Groq vision chat completion with JSON-object mode, one backoff
+// retry on a transient API error (rate limit / server overload), and one
+// retry with a corrective prompt if the response isn't valid JSON matching
+// the schema. Never throws — every path resolves to { success: false } once
+// attempts are exhausted, so callers can degrade gracefully.
+export async function callGroqJson<T>(
+  ai: Groq,
+  schema: z.ZodType<T>,
+  promptText: string,
+  imageDataUrls: string[]
+): Promise<{ success: true; data: T } | { success: false }> {
+  const imageParts = imageDataUrls.map((url) => ({ type: "image_url" as const, image_url: { url } }));
+  let text = promptText;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let raw: string | null | undefined;
+    try {
+      const completion = await ai.chat.completions.create({
+        model: MODEL,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text }, ...imageParts],
+          },
+        ],
+        response_format: { type: "json_object" },
+      });
+      raw = completion.choices[0]?.message?.content;
+    } catch (e) {
+      const retryable = isRetryableError(e);
+      const delay = retryDelayMs(e);
+      console.error(
+        `[callGroqJson] attempt ${attempt}/2 (${retryable ? `retrying after ${delay}ms` : "not retryable"}):`,
+        e instanceof Error ? e.message : e
+      );
+      if (!retryable || attempt === 2) return { success: false };
+      await sleep(delay);
+      continue;
+    }
+
+    let parsedJson: unknown;
+    let issue: string | undefined;
+    try {
+      parsedJson = JSON.parse(raw ?? "");
+    } catch (e) {
+      issue = `Response was not valid JSON (${e instanceof Error ? e.message : String(e)}).`;
+    }
+
+    const result = issue ? undefined : schema.safeParse(parsedJson);
+    if (result?.success) return result;
+    if (!issue) issue = z.prettifyError(result!.error);
+
+    console.error(`[callGroqJson] attempt ${attempt}/2: response failed validation — ${issue}`);
+    if (attempt === 2) return { success: false };
+
+    text = `${promptText}\n\n${RETRY_JSON_ONLY_SUFFIX}\n\nYour previous response was:\n${raw ?? "(empty)"}\n\nThat response failed with this error:\n${issue}\n\nFix it and return ONLY the corrected JSON, matching the required shape exactly.`;
+  }
+
+  return { success: false };
 }

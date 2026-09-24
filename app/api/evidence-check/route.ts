@@ -1,19 +1,26 @@
 import { NextResponse } from "next/server";
 import {
+  callGroqJson,
   getClient,
-  MODEL,
   EvidenceCheckModelResponseSchema,
   buildEvidenceCheckPrompt,
-  RETRY_JSON_ONLY_SUFFIX,
-  parseDataUrl,
   type EvidenceCheckModelResponse,
-} from "@/app/lib/gemini";
+} from "@/app/lib/groq";
 import { defectAction, scoreImage } from "@/app/lib/evidenceScoring";
 import { mapWithConcurrency } from "@/app/lib/concurrency";
 import type { EvidenceCheckItem, EvidenceCheckResult, DefectSignature } from "@/app/lib/types";
 
 const MAX_IMAGES = 10;
-const CONCURRENCY = 3;
+// Kept low: Groq's free tier enforces a per-minute *output tokens* budget
+// (not just a request count), which a burst of 3 concurrent vision calls on
+// non-trivial JSON responses can exceed on its own — see callGroqJson's
+// retry-after handling for what happens when it does.
+const CONCURRENCY = 2;
+
+// Groq's free-tier per-minute output-token budget can force a real ~45s
+// retry wait per image (see callGroqJson) — give a full batch of images
+// room to run instead of hitting Vercel's default function timeout.
+export const maxDuration = 120;
 
 function unconfiguredResult(imageId: string): EvidenceCheckItem {
   return {
@@ -28,7 +35,7 @@ function unconfiguredResult(imageId: string): EvidenceCheckItem {
         risk_score: 0,
         status: "unusable",
         recommended_action: "retake_photo",
-        summary: "GEMINI_API_KEY_2 not configured.",
+        summary: "GROQ_API_KEY_2 not configured.",
       },
     },
   };
@@ -70,36 +77,14 @@ function buildResult(imageId: string, raw: EvidenceCheckModelResponse): Evidence
   };
 }
 
-type ImagePart = { inlineData: { mimeType: string; data: string } };
-
-async function callGemini(ai: NonNullable<ReturnType<typeof getClient>>, promptText: string, imagePart: ImagePart) {
-  const response = await ai.models.generateContent({
-    model: MODEL,
-    contents: [{ role: "user", parts: [{ text: promptText }, imagePart] }],
-    config: { responseMimeType: "application/json" },
-  });
-
-  try {
-    return EvidenceCheckModelResponseSchema.safeParse(JSON.parse(response.text ?? ""));
-  } catch {
-    return { success: false as const };
-  }
-}
-
 async function analyzeImage(
   ai: NonNullable<ReturnType<typeof getClient>>,
   imageId: string,
   dataUrl: string
 ): Promise<EvidenceCheckItem> {
   try {
-    const { mimeType, data } = parseDataUrl(dataUrl);
-    const imagePart = { inlineData: { mimeType, data } };
-    const basePrompt = buildEvidenceCheckPrompt();
+    const parsed = await callGroqJson(ai, EvidenceCheckModelResponseSchema, buildEvidenceCheckPrompt(), [dataUrl]);
 
-    let parsed = await callGemini(ai, basePrompt, imagePart);
-    if (!parsed.success) {
-      parsed = await callGemini(ai, `${basePrompt}\n\n${RETRY_JSON_ONLY_SUFFIX}`, imagePart);
-    }
     if (!parsed.success) {
       console.error(`[evidence-check] ${imageId}: model response failed schema validation twice`);
       return { image_id: imageId, error: true };

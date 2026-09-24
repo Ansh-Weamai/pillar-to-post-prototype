@@ -2,14 +2,14 @@
 
 Prototype QA tool for home inspection photos — coverage check, evidence
 consistency, and contradiction flagging, built on Next.js (App Router) +
-`@google/genai` (Gemini). See `requirements.txt` and `BUILD_PROMPT.md` /
+`groq-sdk` (Groq, Llama 4 vision). See `requirements.txt` and `BUILD_PROMPT.md` /
 `BUILD_PROMPT_REVISION_2.md` for the original design/build spec.
 
 ## Prerequisites
 
 - Node.js `>= 18.17` (this machine has v24 — fine)
 - npm (comes with Node)
-- A Gemini API key from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+- A Groq API key from [console.groq.com/keys](https://console.groq.com/keys)
 - A GitHub account + [Git](https://git-scm.com/downloads) installed
 
 ---
@@ -83,8 +83,10 @@ consistency, and contradiction flagging, built on Next.js (App Router) +
    Then open `.env` and fill in:
 
    ```
-   GEMINI_API_KEY=<your real key from aistudio.google.com/app/apikey>
-   GEMINI_MODEL=gemini-3-flash-preview
+   GROQ_API_KEY_1=<your real key from console.groq.com/keys>
+   GROQ_API_KEY_2=<can reuse the same key, or a separate one per feature>
+   GROQ_API_KEY_3=<can reuse the same key, or a separate one per feature>
+   GROQ_MODEL=qwen/qwen3.8-27b
    ```
 
 4. **Run the dev server:**
@@ -127,7 +129,7 @@ app/
     check-room/        "+ Add photo" — live per-room photo upload + check
     upload-report/     "Upload report" — whole-document (PDF/image) check
   components/          Sidebar, RoomCard, StatusIcon, Lightbox, UploadReportModal
-  lib/                 Shared types, Gemini client/prompts, client room-state logic
+  lib/                 Shared types, Groq client/prompts, client room-state logic
 data/
   checklist.json       The full inspection checklist (locations + required items)
   sample-tour.json     Demo tour data (which locations have photos, for "Load demo data")
@@ -140,14 +142,15 @@ This is a standard Next.js app, so [Vercel](https://vercel.com) works with
 zero config:
 
 1. Import the GitHub repo in the Vercel dashboard.
-2. Add the same environment variables from your `.env` (`GEMINI_API_KEY`,
-   `GEMINI_MODEL`) under Project Settings → Environment Variables.
+2. Add the same environment variables from your `.env` (`GROQ_API_KEY_1`,
+   `GROQ_API_KEY_2`, `GROQ_API_KEY_3`, `GROQ_MODEL`) under Project Settings →
+   Environment Variables.
 3. Deploy — Vercel auto-builds on every push to `main`.
 
 ## Notes
 
 - No database — everything is static config (`data/*.json`) or computed
   on-demand per request. See `requirements.txt` for the full reasoning.
-- Never commit `.env`. If you ever rotate the Gemini API key, only `.env`
+- Never commit `.env`. If you ever rotate a Groq API key, only `.env`
   (local) and your deployment platform's environment variables need
   updating — nothing in the codebase references the key directly.

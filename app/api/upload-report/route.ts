@@ -1,8 +1,29 @@
 import { NextResponse } from "next/server";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getClient, MODEL, ReportResponseSchema, buildReportCheckPrompt, parseDataUrl } from "@/app/lib/gemini";
+import { extractText, getDocumentProxy } from "unpdf";
+import { callGroqJson, getClient, ReportResponseSchema, buildReportCheckPrompt, parseDataUrl } from "@/app/lib/groq";
 import type { ChecklistEntry, ItemUpdate } from "@/app/lib/types";
+
+// Groq's vision models take actual images (png/jpeg/webp/gif) via image_url,
+// not PDFs. A non-image upload is a PDF (per UploadReportModal's `.pdf,image/*`
+// accept + isImage check) — extract its text and send that instead of pixels.
+// unpdf runs pdfjs without a separate worker file/thread, which is what
+// makes it safe to bundle into a Next.js route handler (pdf-parse's own
+// worker resolution breaks under Next's bundler). Text is capped well
+// under the model's context/TPM budget on the free tier.
+const MAX_PDF_TEXT_CHARS = 60000;
+
+// Groq's free-tier per-minute output-token budget can force a real ~45s
+// retry wait (see callGroqJson) — give that room instead of hitting
+// Vercel's default function timeout.
+export const maxDuration = 120;
+
+async function extractPdfText(base64: string): Promise<string> {
+  const pdf = await getDocumentProxy(new Uint8Array(Buffer.from(base64, "base64")));
+  const { text } = await extractText(pdf, { mergePages: true });
+  return text.slice(0, MAX_PDF_TEXT_CHARS);
+}
 
 export async function POST(req: Request) {
   const body = await req.json();
@@ -19,27 +40,29 @@ export async function POST(req: Request) {
     const allItems = checklist.flatMap((entry) =>
       entry.required_items.map((item) => ({ location: entry.location, required_item: item }))
     );
+    const undocumentedUpdates = (): ItemUpdate[] =>
+      allItems.map((i) => ({ ...i, status: "missing", source: "report", condition: null }));
 
     const ai = getClient(1);
     if (!ai) {
-      const updates: ItemUpdate[] = allItems.map((i) => ({ ...i, status: "missing", source: "report", condition: null }));
-      return NextResponse.json({ updates });
+      return NextResponse.json({ updates: undocumentedUpdates() });
     }
 
     const { mimeType, data } = parseDataUrl(dataUrl);
+    const isImage = mimeType.startsWith("image/");
 
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: buildReportCheckPrompt(checklist) }, { inlineData: { mimeType, data } }],
-        },
-      ],
-      config: { responseMimeType: "application/json" },
-    });
+    const parsed = isImage
+      ? await callGroqJson(ai, ReportResponseSchema, buildReportCheckPrompt(checklist, "image"), [dataUrl])
+      : await (async () => {
+          const reportText = (await extractPdfText(data)).trim();
+          if (!reportText) {
+            console.error("[upload-report]: PDF text extraction produced no text (scanned/image-only PDF?)");
+            return { success: false as const };
+          }
+          const prompt = `${buildReportCheckPrompt(checklist, "text")}\n\nHere is the full text extracted from the report document:\n\n"""\n${reportText}\n"""`;
+          return callGroqJson(ai, ReportResponseSchema, prompt, []);
+        })();
 
-    const parsed = ReportResponseSchema.safeParse(JSON.parse(response.text ?? ""));
     const resultByKey = new Map(
       parsed.success ? parsed.data.results.map((r) => [`${r.location}::${r.required_item}`, r]) : []
     );
