@@ -328,6 +328,27 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Models occasionally ignore "no markdown fences" / "no extra commentary"
+// instructions and wrap the JSON in ```json fences or a leading/trailing
+// sentence. Strip fences and, failing a direct parse, fall back to the
+// outermost {...} substring rather than failing on text that IS valid JSON
+// once the wrapper is removed.
+function extractJsonObject(raw: string): string {
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const candidate = (fenced ? fenced[1] : raw).trim();
+  try {
+    JSON.parse(candidate);
+    return candidate;
+  } catch {
+    const start = candidate.indexOf("{");
+    const end = candidate.lastIndexOf("}");
+    if (start !== -1 && end !== -1 && end > start) {
+      return candidate.slice(start, end + 1);
+    }
+    return candidate;
+  }
+}
+
 function errorStatus(e: unknown): number | undefined {
   return e && typeof e === "object" && "status" in e && typeof (e as { status: unknown }).status === "number"
     ? (e as { status: number }).status
@@ -389,7 +410,7 @@ export async function callGroqJson<T>(
     let parsedJson: unknown;
     let issue: string | undefined;
     try {
-      parsedJson = JSON.parse(raw ?? "");
+      parsedJson = JSON.parse(extractJsonObject(raw ?? ""));
     } catch (e) {
       issue = `Response was not valid JSON (${e instanceof Error ? e.message : String(e)}).`;
     }
