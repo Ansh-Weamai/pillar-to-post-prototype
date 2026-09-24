@@ -393,6 +393,15 @@ export async function callGroqJson<T>(
           },
         ],
         response_format: { type: "json_object" },
+        // qwen3 models reason by default (reasoning_effort defaults to
+        // "medium") and, without this, that <think>...</think> reasoning
+        // gets interleaved into message.content alongside the JSON —
+        // extractJsonObject's brace-matching then grabs braces out of the
+        // reasoning text instead of the actual answer, so parsing fails
+        // more often the longer/more complex the prompt is (rare in quick
+        // dev smoke tests, routine under real multi-image/production
+        // traffic). Hiding it keeps content pure JSON.
+        reasoning_format: "hidden",
       });
       raw = completion.choices[0]?.message?.content;
     } catch (e) {
